@@ -1,0 +1,13 @@
+// Tanult gyártási folyamat (párhuzamos)
+digraph {
+	rankdir=TB size="10,8"
+	Start [label="Gyártás kezdete" fillcolor=lightblue shape=ellipse style=filled]
+	End [label="Gyártás vége" fillcolor=lightblue shape=ellipse style=filled]
+	Start -> step0
+	{
+		rank=same
+		step0 [label="Szeval_1
+(CNC1 - Kati)" fillcolor=lightgreen shape=box style="rounded,filled"]
+	}
+	step0 -> End
+}
