@@ -19,6 +19,14 @@ class FactoryEnv(gym.Env):
         self.machines = ["CNC1", "CNC2", "CNC3"]
         self.operators = ["Kati", "Bela"]
 
+        self.taskorder = []  #Ez a lista fogja tárolni a feladatok sorrendjét, hogy majd később költséget számoljunk
+        # selejt arány definiálása
+        for task in self.tasks:
+            if task.startswith("felmelegites"):
+                setattr(self, f"{task}_defect_rate", 0.1)  # 10% selejt a felmelegítésnél
+            else:
+                setattr(self, f"{task}_defect_rate", 0.0)  # egyébként nincs selejt
+                
         self.action_space = gym.spaces.Discrete(len(self.tasks) * len(self.operators))   #Action space, tehát amit tehet az AI, minden lépésben egy számot választ a [0, n-1] tartományból. Pl:5 feladat × 2 operátor = 10
         self.observation_space = gym.spaces.Box(                                            #Observation space, vektorokkal adjuk meg, pl most 8 mert van 5 feladat 3 gépre
             low=0, high=1, shape=(len(self.tasks) + len(self.machines),), dtype=np.float32  #0 és 1 között vehet fel értéket 0 nincs kész 1 kész van
@@ -87,7 +95,7 @@ class FactoryEnv(gym.Env):
         op_idx = action // len(self.tasks) #itt ugyanígy az operátórt
         task = self.tasks[task_idx]
         operator = self.operators[op_idx]
-
+        self.taskorder.append(task)  # várható költség számoláshoz eltároljuk a sorrendet
         # gépek hozzárendelése
         if task == "keveres" or task == "szeval_1":
             machine = "CNC1"
@@ -125,7 +133,8 @@ class FactoryEnv(gym.Env):
 
         # ha minden feladat kész → extra jutalom
         if done:
-            reward += 100
+            reward += 1000
+            reward -= self.cost_estimate()  # levonjuk a költséget a végső jutalomból
             self.operator_busy = {op: 0 for op in self.operators}
 
         return self.state, reward, done, False, {}
@@ -137,6 +146,17 @@ class FactoryEnv(gym.Env):
         self.done = False
         self.operator_busy = {op: 0 for op in self.operators}
         return self.state, {}
+    
+    def cost_estimate(self)-> float:
+        # egyszerű költségmodell: minden feladat 10 egység, minden selejt 5 egység
+        base_cost = 10
+        total_cost = 0.0
+        for task in self.taskorder:
+            total_cost += base_cost
+            defect_rate = getattr(self, f"{task}_defect_rate", 0.0)
+            defect_mult = 1.0 / (1.0 - defect_rate) if defect_rate > 0 else 1.0
+            total_cost *= defect_mult
+        return total_cost
 
 
 # ÚJ RÉSZ: Egyszerű szöveges ütemezés (időszeletek soronként)
