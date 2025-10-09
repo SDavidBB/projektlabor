@@ -154,6 +154,8 @@ class FactoryEnv(gym.Env):
         for task in self.taskorder:
             total_cost += base_cost
             defect_rate = getattr(self, f"{task}_defect_rate", 0.0)
+            # ha a folyamat selejtet termel,
+            # akkor bele kell számolni a pótlási költséget a várható költségbe
             defect_mult = 1.0 / (1.0 - defect_rate) if defect_rate > 0 else 1.0
             total_cost *= defect_mult
         return total_cost
