@@ -1,149 +1,145 @@
+import os
+import csv
 import gymnasium as gym
 import numpy as np
+import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-import graphviz
-import os
+from stable_baselines3.common.monitor import Monitor
 
-# biztosítjuk, hogy a Graphviz futtatható   #Nem akart lefutni sehogysem a Graphviz, és ezt talátam megoldásnak
-# ÚJ RÉSZ: javított PATH (ne legyen szóköz a "C:\" és "Program" között) – csak a biztonság kedvéért
+# Graphviz PATH (ha nálad kell)
 os.environ["PATH"] += os.pathsep + r"C:\Program Files\Graphviz\bin"
 
 
-#  Gyártási környezet definiálása
+# -------------------------
+#  Gyártási környezet
+# -------------------------
 class FactoryEnv(gym.Env):
-    def __init__(self): #Konstruktor 
+    def __init__(self):
         super().__init__()
-        # Feladatok, gépek, operátorok - ezeket ismeri a modell úgymond egy szótár
+
         self.tasks = ["keveres", "szeval_1", "szeval_2", "szeval_3", "felmelegites"]
         self.machines = ["CNC1", "CNC2", "CNC3"]
         self.operators = ["Kati", "Bela"]
 
-        self.action_space = gym.spaces.Discrete(len(self.tasks) * len(self.operators))   #Action space, tehát amit tehet az AI, minden lépésben egy számot választ a [0, n-1] tartományból. Pl:5 feladat × 2 operátor = 10
-        self.observation_space = gym.spaces.Box(                                            #Observation space, vektorokkal adjuk meg, pl most 8 mert van 5 feladat 3 gépre
-            low=0, high=1, shape=(len(self.tasks) + len(self.machines),), dtype=np.float32  #0 és 1 között vehet fel értéket 0 nincs kész 1 kész van
+        self.action_space = gym.spaces.Discrete(len(self.tasks) * len(self.operators))
+        self.observation_space = gym.spaces.Box(
+            low=0, high=1,
+            shape=(len(self.tasks) + len(self.machines),),
+            dtype=np.float32
         )
 
-        self.state = np.zeros(len(self.tasks) + len(self.machines))  #0ról indulunk tehát minden feladat nincs még kész és minden gép üres.
-        self.done = False               #Self done annyit jelent hogy nincs kész még a feladat
-        # operátorok foglaltsága
-        self.operator_busy = {op: 0 for op in self.operators}    #Itt hoztam be hogy Béla tudjon egyszerre két gépen dolgozni késöbb a Step()-ben lesz fontos
+        # állapot
+        self.state = np.zeros(len(self.tasks) + len(self.machines), dtype=np.float32)
 
-        # ÚJ RÉSZ: feladat-index térkép és előfeltételek (DAG)
-        # ez kényszeríti a sorrendet: szeval_1 → szeval_2 → szeval_3.
+        # előfeltételek (DAG)
         self.task_index = {t: i for i, t in enumerate(self.tasks)}
         self.prereq = {
             "szeval_2": ["szeval_1"],
             "szeval_3": ["szeval_2"],
-            # "felmelegites": ["szeval_3"],
         }
 
-        # ÚJ RÉSZ: sorrend-bónusz paraméter
-        # ha pont a következő kötelező szétválasztási lépést választja, +5 jutalom
+        # reward paraméterek
         self.sequence_bonus = 5
- 
-    # ÚJ RÉSZ: előfeltételek ellenőrzése
-    # csak akkor engedünk egy taskot, ha minden előfeltétele már kész.
+
+        # epizód-limit, hogy biztosan záródjon epizód (különben a Monitor üres maradhat)
+        self.max_steps = 50
+        self.steps = 0
+
+    # --- segédfüggvények ---
     def prereq_satisfied(self, task: str) -> bool:
         reqs = self.prereq.get(task, [])
         return all(self.state[self.task_index[r]] == 1 for r in reqs)
 
-    # ÚJ RÉSZ: mi a „következő elvárt” szétválasztási lépés a jelen állapotban
-    # ezt használjuk a sequence bonus kiszámításához
     def next_required_split_task(self):
         for t in ["szeval_1", "szeval_2", "szeval_3"]:
             if self.state[self.task_index[t]] == 0:
                 return t
-        return None  # mind kész
+        return None
 
-    # Érvényes döntésvizsgálat - a feladat leírás alapján
-    def valid_action(self, task, machine, operator):
+    def infer_machine(self, task: str) -> str:
+        if task in ("keveres", "szeval_1"):
+            return "CNC1"
+        elif task in ("szeval_2", "felmelegites"):
+            return "CNC3"
+        else:
+            return "CNC2"
+
+    def valid_action(self, task, machine, operator) -> bool:
+        # gépszabályok
         if task == "keveres" and machine != "CNC1":
             return False
         if task == "felmelegites" and machine != "CNC3":
             return False
-        if task.startswith("szeval_") and machine not in ["CNC1", "CNC3", "CNC2"]:
+        if task.startswith("szeval_") and machine not in ["CNC1", "CNC2", "CNC3"]:
             return False
         if operator == "Bela" and machine == "CNC1":
             return False
 
-        # ÚJ RÉSZ: előfeltétel-szabályok érvényesítése
-        # tiltjuk a rossz sorrendet (pl. szeval_3 nem mehet szeval_2 előtt).
+        # előfeltételek
         if not self.prereq_satisfied(task):
             return False
 
-        # Kati egyszerre csak 1 gépet használhat
-        if operator == "Kati" and self.operator_busy["Kati"] == 1:
-            return False
-        # Béla maximum 2 gépen dolgozhat egyszerre
-        if operator == "Bela" and self.operator_busy["Bela"] >= 2:
-            return False
-
+        # FONTOS: „busy” korlátot itt nem érvényesítünk,
+        # mert egy step = egy akció, nincs „egylépésen belüli” párhuzam.
         return True
 
-    # RL lépés
-    def step(self, action): 
-        task_idx = action % len(self.tasks)  #Ugye az action az action térből, és segítségével visszanyerjük a taskot  (action=task*operátór)
-        op_idx = action // len(self.tasks) #itt ugyanígy az operátórt
+    # --- RL API ---
+    def step(self, action):
+        self.steps += 1
+
+        task_idx = action % len(self.tasks)
+        op_idx = action // len(self.tasks)
         task = self.tasks[task_idx]
         operator = self.operators[op_idx]
+        machine = self.infer_machine(task)
 
-        # gépek hozzárendelése
-        if task == "keveres" or task == "szeval_1":
-            machine = "CNC1"
-        elif task == "szeval_2" or task == "felmelegites":
-            machine = "CNC3"
-        else:
-            machine = "CNC2"
-
-        # akció értékelése
+        # érvényesség
         if not self.valid_action(task, machine, operator):
-            reward = -1
-            # 🔹 ÚJ RÉSZ: azonnali visszatérés invalid akciónál (nem módosítunk state-en)
-            # Magyarázat: így a PPO nem tud "félre tanulni" tiltott lépéseket.
-            return self.state, reward, False, False, {}
+            # enyhe büntetés az érvénytelenért
+            reward = -1.0
+            terminated = False
+            truncated = self.steps >= self.max_steps
+            return self.state, reward, terminated, truncated, {}
 
-        # ÚJ RÉSZ: ha a feladat már kész, azonnal elutasítjuk (early return)
-        # nincs állapotváltozás, erős büntetés; ettől tűnnek el a duplikációk a fáról.
+        # ha már kész volt
         if self.state[task_idx] == 1:
-            reward = -20   # már elvégzett feladatért negatív jutalom
-            return self.state, reward, False, False, {}
+            reward = -20.0
+            terminated = False
+            truncated = self.steps >= self.max_steps
+            return self.state, reward, terminated, truncated, {}
 
-        # új, érvényes feladat
-        reward = +1   # új, érvényes feladatért pozitív jutalom
+        # érvényes, új feladat
+        reward = 1.0
 
-        # ÚJ RÉSZ: sorrend-bónusz a szétválasztás helyes következő lépéséért
-        # így preferálja a szeval_1 → szeval_2 → szeval_3 sorrendet
+        # sorrend-bónusz (szeval_1 -> szeval_2 -> szeval_3)
         next_req = self.next_required_split_task()
         if next_req is not None and task == next_req:
             reward += self.sequence_bonus
 
-        self.state[task_idx] = 1
-        self.operator_busy[operator] += 1
+        # állapot frissítése
+        self.state[task_idx] = 1.0
 
-        done = all(self.state[:len(self.tasks)])
+        # epizód vége logika
+        terminated = bool(all(self.state[:len(self.tasks)]))
+        truncated = self.steps >= self.max_steps
 
-        # ha minden feladat kész → extra jutalom
-        if done:
-            reward += 100
-            self.operator_busy = {op: 0 for op in self.operators}
+        # ha minden kész: nagy bónusz
+        if terminated:
+            reward += 100.0
 
-        return self.state, reward, done, False, {}
+        return self.state, reward, terminated, truncated, {}
 
-    # reset a környezet újraindításához ahoz szükséges hogy ujra tanuljunk
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.state = np.zeros(len(self.tasks) + len(self.machines))
-        self.done = False
-        self.operator_busy = {op: 0 for op in self.operators}
+        self.state[:] = 0.0
+        self.steps = 0
         return self.state, {}
 
 
-# ÚJ RÉSZ: Egyszerű szöveges ütemezés (időszeletek soronként)
-#  A PPO egy akciót ad lépésenként. Itt "időszeletekbe" csoportosítjuk az akciókat:
-# egy szeletben minden operátor legfeljebb 1 feladatot kaphat → párhuzamos végrehajtás egyszerűen.
-
-# ÚJ RÉSZ: feladatnév "szépítése" magyar ékezetekkel (csak a kiíráshoz)
+# -------------------------
+#  Szöveges ütemező
+# -------------------------
 def pretty_task_name(task: str) -> str:
     mapping = {
         "keveres": "Keverés",
@@ -154,7 +150,6 @@ def pretty_task_name(task: str) -> str:
     }
     return mapping.get(task, task.capitalize())
 
-# ÚJ RÉSZ: gép hozzárendelés (ugyanaz a logika mint a step-ben) – külön használjuk a kiíráshoz
 def infer_machine(task: str) -> str:
     if task in ("keveres", "szeval_1"):
         return "CNC1"
@@ -163,25 +158,11 @@ def infer_machine(task: str) -> str:
     else:
         return "CNC2"
 
-# ÚJ RÉSZ: validáció a szöveges ütemezéshez – NEM vesszük figyelembe a "busy" szabályt,
-# csak a gép–feladathoz illeszkedést és az előfeltételeket. Így Kati minden új szeletben tud dolgozni.
-def valid_for_schedule(shadow: FactoryEnv, task: str, machine: str, operator: str) -> bool:
-    if task == "keveres" and machine != "CNC1":
-        return False
-    if task == "felmelegites" and machine != "CNC3":
-        return False
-    if task.startswith("szeval_") and machine not in ["CNC1", "CNC3", "CNC2"]:
-        return False
-    # előfeltételek
-    return shadow.prereq_satisfied(task)
-
-# ÚJ RÉSZ: akciók időszeletek (egy szelet = egyszerre végrehajtott feladatok, op-onként max 1)
 def actions_to_timeslices(actions, env: FactoryEnv):
     shadow = FactoryEnv(); shadow.reset()
-    # aktuális szelet: op → (task, machine)
     slice_map = {op: None for op in env.operators}
     used_ops = set()
-    timeslices = []  # lista: dict(op -> (task, machine) VAGY None)
+    timeslices = []
 
     for a in actions:
         task_idx = int(a) % len(env.tasks)
@@ -190,62 +171,55 @@ def actions_to_timeslices(actions, env: FactoryEnv):
         op       = env.operators[op_idx]
         machine  = infer_machine(task)
 
-        # ha az adott op már kapott a mostani szeletben, lezárjuk a szeletet és újat kezdünk
+        # ha ugyanabban a szeletben már kapott az op, zárunk
         if op in used_ops:
-            # szelet lezárása → állapot frissítése
             for v in slice_map.values():
                 if v is None: 
                     continue
-                t, m = v
+                t, _ = v
                 shadow.state[shadow.task_index[t]] = 1
             timeslices.append(slice_map)
             slice_map = {o: None for o in env.operators}
-            used_ops = set()
+            used_ops.clear()
 
-        # hagyjuk ki azokat a lépéseket, amelyek már teljesített feladatot céloznak vagy érvénytelenek
+        # kihagyjuk a már kész/érvénytelen lépéseket
         if shadow.state[shadow.task_index[task]] == 1:
             continue
-        if not valid_for_schedule(shadow, task, machine, op):
+        if not shadow.prereq_satisfied(task):
             continue
 
         slice_map[op] = (task, machine)
         used_ops.add(op)
 
-        # ha minden operátor kapott feladatot, zárjuk a szeletet
         if len(used_ops) == len(env.operators):
             for v in slice_map.values():
-                if v is None:
+                if v is None: 
                     continue
-                t, m = v
+                t, _ = v
                 shadow.state[shadow.task_index[t]] = 1
             timeslices.append(slice_map)
             slice_map = {o: None for o in env.operators}
-            used_ops = set()
+            used_ops.clear()
 
-    # maradék szelet lezárása (ha van benne bármi)
     if any(v is not None for v in slice_map.values()):
         for v in slice_map.values():
-            if v is None:
+            if v is None: 
                 continue
-            t, m = v
+            t, _ = v
             shadow.state[shadow.task_index[t]] = 1
         timeslices.append(slice_map)
 
     return timeslices
 
-# ÚJ RÉSZ: szöveges kiírás soronként
 def print_text_schedule(actions, env: FactoryEnv):
     slices = actions_to_timeslices(actions, env)
     if not slices:
         print("Nincs ütemezhető művelet.")
         return
 
-    # oszlop-szélességekhez egy kis formázás
     col_names = env.operators
-    width_left  = 4
-    width_col   = 28  # egy oszlop szélessége (név + feladat)
+    width_left, width_col = 4, 28
     sep = "  |  "
-
     for i, sl in enumerate(slices, start=1):
         parts = []
         for op in col_names:
@@ -259,40 +233,79 @@ def print_text_schedule(actions, env: FactoryEnv):
         print(line)
 
 
-# Fő program
+# -------------------------
+#  Tanulási görbe rajzoló
+# -------------------------
+def plot_learning_curve(monitor_csv_path: str, out_png: str = "rewards.png"):
+    ep_rewards, ep_idx = [], []
+
+    if not os.path.exists(monitor_csv_path):
+        print(f"Nem található monitor fájl: {monitor_csv_path}")
+        return
+
+    with open(monitor_csv_path, "r", newline="") as f:
+        _ = f.readline()  # JSON header
+        reader = csv.DictReader(f)
+        i = 1
+        for row in reader:
+            try:
+                r = float(row.get("r", "nan"))
+            except ValueError:
+                continue
+            if np.isfinite(r):
+                ep_rewards.append(r); ep_idx.append(i); i += 1
+
+    if not ep_rewards:
+        print("A monitor fájl üresnek tűnik (nem zárult epizód?).")
+        return
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(ep_idx, ep_rewards)
+    plt.xlabel("Epizód"); plt.ylabel("Összjutalom (return)")
+    plt.title("PPO tanulási görbe (Monitor)")
+    plt.grid(True, linestyle=":", alpha=0.5)
+    plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
+    print(f" Tanulási görbe mentve: {out_png}")
+
+
+# -------------------------
+#  Fő program
+# -------------------------
 if __name__ == "__main__":
-    env = FactoryEnv()
-    print("Környezet inicializálva ")
-    obs = env.reset()
-    print("Kezdő állapot:", obs)
+    # Log könyvtár + monitorozott környezet
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    monitor_path = os.path.join(log_dir, "monitor.csv")
 
-    # manuális lépések megfigyeléshez
-    for i in range(5):
-        action = env.action_space.sample()
-        obs, reward, done, _, _ = env.step(action)
-        print(f"Lépés {i+1}: akció={action}, jutalom={reward}, kész={done}, foglaltság={env.operator_busy}")
-        if done:
-            print("Epizód vége ")
-            break
+    def make_env():
+        e = FactoryEnv()
+        # a Monitor ide írja az epizódokat
+        return Monitor(e, monitor_path)
 
-    # PPO tanulás
-    print("\n  PPO modell tanítása indul...")
-    env = DummyVecEnv([lambda: FactoryEnv()])
-    model = PPO("MlpPolicy", env, learning_rate=0.0001, ent_coef=0.01, verbose=1)
-    model.learn(total_timesteps=200000) 
-    print("Tanítás kész")
+    # (opcionális) kézi próba
+    raw = FactoryEnv()
+    obs, _ = raw.reset()
+    print("Kézi próba – kezdő állapot:", obs)
 
-    # Szimuláció a tanult modell alapján
+    # PPO tanítás monitorozott környezetben
+    print("\nPPO tanítás indul…")
+    env = DummyVecEnv([make_env])
+    model = PPO("MlpPolicy", env, learning_rate=1e-4, ent_coef=0.01, verbose=1)
+    model.learn(total_timesteps=50_000)  # elég, hogy több epizód is lezáruljon
+    print("Tanítás kész.")
+
+    # Tanulási görbe
+    plot_learning_curve(monitor_path, out_png="rewards.png")
+
+    # Kiértékelés + szöveges ütemezés
     actions_taken = []
     obs = env.reset()
-    for _ in range(50):  # ÚJ RÉSZ: több lépés, hogy „végigérjen”
-        # ÚJ RÉSZ: kis sztochasztika, hogy ne ragadjon be egy akcióba
-        action, _ = model.predict(obs, deterministic=False)
+    for _ in range(50):
+        action, _ = model.predict(obs, deterministic=True)
         actions_taken.append(int(action[0]))
         obs, reward, done, info = env.step(action)
-        if done:
+        if bool(done[0]):  # VecEnv: bármelyik env lezárt
             break
 
-    # ÚJ RÉSZ: Egyszerű szöveges ütemezés kiírása (ez helyettesíti a vizuális ábrát)
     print("\nEgyszerű ütemezés (időszeletek):")
     print_text_schedule(actions_taken, FactoryEnv())
